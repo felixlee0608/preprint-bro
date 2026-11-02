@@ -11,3 +11,18 @@ Plan an interactive course on this paper for the reader described above, as JSON
 - `quiz`: 8 questions across the lessons that test understanding, not trivia. Plausible wrong options; vary which position is correct.
 - `glossary`: the terms a beginner would need to look up.
 - `chips`: for example "🎓 For curious beginners", "🧪 8 hands-on labs", "📄 From the 2017 paper".
+
+## JSON structure (field names are exact)
+
+Reply with only the JSON object, no markdown fences, no commentary. Top level has exactly these fields:
+
+- `course_title`: string
+- `tagline`: string
+- `lede`: string
+- `minutes`: number (total estimated minutes)
+- `chips`: array of strings
+- `lessons`: array of objects with exactly `title` (string), `nav_title` (short string), `eyebrow` (short string), `minutes` (number), `objectives` (array of strings), `paper_sections` (array of strings), `key_ideas` (array of strings), `figure` (string, '' or a figure key), `lab` (object with `title`, `idea`, `controls`, `what_it_shows`, all strings)
+- `quiz`: array of 8 objects with exactly `question` (string), `options` (array of 4 strings), `answer` (number, the 0-based index of the correct option), `explanation` (string)
+- `glossary`: array of objects with exactly `term` (string) and `definition` (string)
+
+Do not add, rename, or omit any field. Do not wrap the JSON in backticks or a code block.

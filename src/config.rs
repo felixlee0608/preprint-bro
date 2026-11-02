@@ -169,8 +169,11 @@ pub fn providers_from_env() -> Result<Vec<Endpoint>> {
     let mut names: Vec<String> = std::env::vars()
         .filter(|(k, _)| k.starts_with("LLM_") && k.ends_with("_BASE_URL"))
         .filter_map(|(k, _)| {
-            let name = k.strip_prefix("LLM_")?.strip_suffix("_BASE_URL")?;
-            Some(name.to_ascii_lowercase())
+            // "LLM_BASE_URL" strips to just "BASE_URL", which doesn't end in
+            // "_BASE_URL" again; unwrap_or_default turns that into "" → default.
+            let rest = k.strip_prefix("LLM_")?;
+            let name = rest.strip_suffix("_BASE_URL").unwrap_or_default();
+            Some(if name.is_empty() { "default".to_string() } else { name.to_ascii_lowercase() })
         })
         .collect();
     names.sort();
@@ -373,6 +376,31 @@ mod tests {
         assert!(err.contains("LLM_BASE_URL"), "{err}");
         let err = Endpoint::from_vars_for("default", vars(&[("LLM_BASE_URL", "https://ep.example/v1")])).unwrap_err().to_string();
         assert!(err.contains("LLM_MODEL"), "{err}");
+    }
+
+    #[test]
+    fn bare_llm_vars_name_the_default_provider() {
+        // providers_from_env scans the real environment: the legacy LLM_* vars
+        // must come out as one provider named `default` (not an empty name).
+        unsafe {
+            std::env::set_var("LLM_BASE_URL", "https://api.deepseek.com/v1");
+            std::env::set_var("LLM_MODEL", "deepseek-flash");
+            std::env::set_var("LLM_API_KEY", "sk-test");
+            std::env::set_var("LLM_OLLAMA_BASE_URL", "http://localhost:11434/v1");
+            std::env::set_var("LLM_OLLAMA_MODEL", "qwen2.5:7b");
+        }
+        let providers = providers_from_env().unwrap();
+        unsafe {
+            std::env::remove_var("LLM_BASE_URL");
+            std::env::remove_var("LLM_MODEL");
+            std::env::remove_var("LLM_API_KEY");
+            std::env::remove_var("LLM_OLLAMA_BASE_URL");
+            std::env::remove_var("LLM_OLLAMA_MODEL");
+        }
+        let names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["default", "ollama"], "bare LLM_* vars must be the `default` provider");
+        assert_eq!(providers[0].url, "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(providers[0].model, "deepseek-flash");
     }
 
     #[test]

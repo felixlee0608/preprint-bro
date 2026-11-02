@@ -540,7 +540,7 @@ impl Job {
         let schema = crate::llm::strict(json!({"type": "object", "properties": {
             "quiz": course::outline_schema()["properties"]["quiz"].clone()}}));
         let task = format!(
-            "# Your task: fix the quiz\n\nA reviewer found problems in this course's quiz. Return the whole quiz, corrected, with the same number of questions.\n\n<<<QUIZ\n{}\nQUIZ>>>\n\nProblems:\n{}\n",
+            "# Your task: fix the quiz\n\nA reviewer found problems in this course's quiz. Return the whole quiz as JSON, corrected, with the same number of questions, matching the schema.\n\n<<<QUIZ\n{}\nQUIZ>>>\n\nProblems:\n{}\n",
             serde_json::to_string_pretty(&outline.quiz)?,
             findings.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n")
         );
