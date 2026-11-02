@@ -233,6 +233,22 @@ pub fn from_jats(source: Source, id: &str, version: u32, xml: &str) -> Result<Pa
     let mut w = JatsWalker { out: String::new(), figures: Vec::new(), base, fig_no: 0 };
     w.walk(&body);
     let text = tidy(&w.out);
+    if text.len() < 2_000 {
+        // A body that walked to nothing usually means bioRxiv served an
+        // abstract-only JATS (metadata + abstract, no body) for this version,
+        // not a failed fetch. Surface that instead of a bare character count.
+        let has_abstract = doc
+            .root_element()
+            .descendants()
+            .any(|n| n.has_tag_name("abstract"));
+        let hint = if has_abstract {
+            " (the JATS has metadata and an abstract but no body/full-text; \
+             bioRxiv hasn't published the body XML for this version)"
+        } else {
+            ""
+        };
+        bail!("only {} characters of text came out of the paper{hint}", text.len());
+    }
     check_size(&text)?;
     Ok(Paper { kind: "jats".into(), text, figures: w.figures })
 }
@@ -584,5 +600,25 @@ mod tests {
         let p = from_jats(Source::Biorxiv, "10.1101/2024.06.28.601293", 1, &xml).unwrap();
         assert!(p.text.contains("[Fig. 1 Adaptation by feedback type.]"), "{}", &p.text[..300]);
         assert!(p.figures.is_empty());
+    }
+
+    /// bioRxiv sometimes serves a JATS that is metadata + abstract only,
+    /// with no body text (e.g. a new version whose body XML hasn't been
+    /// generated). from_jats must fail with a diagnosis, not a bare count.
+    #[test]
+    fn jats_abstract_only_diagnoses_missing_body() {
+        let xml = r#"<article xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:hwp="http://schema.highwire.org/journal">
+            <front><article-meta><title-group><article-title>The nitroplast genome</article-title></title-group>
+            <abstract><p>Braarudosphaera bigelowii hosts the nitrogen-fixing organelle UCYN-A.
+            This abstract is a couple of sentences long and contains no body content at all,
+            but that is still far too little text to build a course from.</p></abstract>
+            </article-meta></front>
+            <body><supplementary-material position="float" hwp:id="DC1"><object-id pub-id-type="other">DC1</object-id>
+            <label>Supplementary information</label><media xlink:href="supplements/762046_file02.pdf"/></supplementary-material></body>
+            </article>"#;
+        let e = from_jats(Source::Biorxiv, "10.64898/2026.10.26.762046", 1, xml).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("0 characters"), "{msg}");
+        assert!(msg.contains("abstract"), "{msg}");
     }
 }

@@ -112,6 +112,18 @@ impl Client {
     /// system curl (Secure Transport on macOS, OpenSSL elsewhere) passes.
     /// Both platforms ship curl, so self-hosting still needs nothing extra.
     pub async fn full_xml(&self, url: &str) -> Result<Option<String>> {
+        // Offline / rate-limited path: when PREPRINT_XML_FILE points at a
+        // local JATS XML file, read it instead of hitting the network.
+        // Handy for testing against a paper while its server is
+        // rate-limiting your IP (bioRxiv's Cloudflare blocks are aggressive).
+        if let Ok(path) = std::env::var("PREPRINT_XML_FILE") {
+            if !path.trim().is_empty() {
+                let body = tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| format!("reading PREPRINT_XML_FILE {path}"))?;
+                return Ok(Some(body));
+            }
+        }
         const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
         let url = url.to_string();
         let out = tokio::process::Command::new("curl")
