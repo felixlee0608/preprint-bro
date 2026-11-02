@@ -1,9 +1,11 @@
 //! bioRxiv and medRxiv: metadata from api.biorxiv.org, full text as JATS XML.
 //!
 //! The metadata API is open and lightweight, and serves both servers (the
-//! `server` path element picks which). Full text and figures live on
-//! www.biorxiv.org / www.medrxiv.org behind Cloudflare, which rate-limits by
-//! IP; a self-hosted builder fetches each paper once per build, comfortably
+//! `server` path element picks which); it is fetched with reqwest. Full text
+//! lives on www.biorxiv.org / www.medrxiv.org behind Cloudflare, which
+//! fingerprints the HTTP client (reqwest's rustls handshake gets
+//! challenged/429'd) and rate-limits by IP, so the full text is fetched with
+//! the system `curl` using browser headers, once per build — comfortably
 //! inside the limit as long as builds aren't hammered.
 //!
 //! A bare `10.1101/…` DOI could be from either server, so `meta` takes the
@@ -58,8 +60,16 @@ pub struct Client {
 
 impl Client {
     pub fn new() -> Result<Self> {
+        // A browser-like UA and headers: bioRxiv/medRxiv full text sits behind
+        // Cloudflare, which answers 429 / challenge pages to requests that do
+        // not look like a browser (a bare custom UA was enough to get blocked).
+        // The papers are openly licensed; this just fetches each one once.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::ACCEPT, "application/xml,text/xml,application/xhtml+xml,*/*;q=0.8".parse()?);
+        headers.insert(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse()?);
         let http = reqwest::Client::builder()
-            .user_agent("preprint-bro/0.2 (self-hosted preprint course builder)")
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .default_headers(headers)
             .timeout(Duration::from_secs(90))
             .build()?;
         Ok(Self { http })
@@ -95,22 +105,49 @@ impl Client {
     /// answers 404 (a version that stopped existing). A 403/429 means the
     /// site's Cloudflare is rate-limiting this IP: that is surfaced as an
     /// error with a hint, not silently treated as "no full text".
+    ///
+    /// Full text is fetched with the system `curl`, not reqwest: Cloudflare
+    /// fingerprints the HTTP client's TLS stack, and reqwest's rustls hand
+    /// shake is challenged/429'd even with browser headers, while the
+    /// system curl (Secure Transport on macOS, OpenSSL elsewhere) passes.
+    /// Both platforms ship curl, so self-hosting still needs nothing extra.
     pub async fn full_xml(&self, url: &str) -> Result<Option<String>> {
-        let resp = self.http.get(url).send().await.with_context(|| format!("GET {url}"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+        const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        let url = url.to_string();
+        let out = tokio::process::Command::new("curl")
+            .args(["-sSL", "-m", "30"])
+            .arg("-A")
+            .arg(UA)
+            .arg("-H")
+            .arg("Accept: application/xml,text/xml,application/xhtml+xml,*/*;q=0.8")
+            .arg("-H")
+            .arg("Accept-Language: en-US,en;q=0.9")
+            .arg("-w")
+            .arg("\n%{http_code}")
+            .arg(&url)
+            .output()
+            .await
+            .with_context(|| format!("running curl for {url}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let code: u16 = stdout.rsplit('\n').next().unwrap_or("").trim().parse().unwrap_or(0);
+        let body = stdout.trim_end_matches('\n').rsplit_once('\n').map(|(b, _)| b.to_string()).unwrap_or_default();
+        if code == 0 {
+            bail!("curl could not reach {url} (exit {})", out.status.code().unwrap_or(-1));
         }
-        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
-            bail!(
-                "{host} answered {status} — its CDN is rate-limiting this IP \
+        match code {
+            404 => return Ok(None),
+            403 | 429 => bail!(
+                "{url} answered {code} — its CDN is rate-limiting this IP \
                  (preprint servers throttle aggressively; a few minutes between builds usually clears it). \
                  Retry the build a little later."
-            );
+            ),
+            _ if code < 200 || code >= 300 => bail!("{url} answered HTTP {code}"),
+            _ => {}
         }
-        let text = resp.error_for_status().with_context(|| format!("GET {url}"))?.text().await?;
-        Ok(Some(text))
+        if body.trim().is_empty() {
+            bail!("{url} answered 200 with an empty body");
+        }
+        Ok(Some(body))
     }
 }
 

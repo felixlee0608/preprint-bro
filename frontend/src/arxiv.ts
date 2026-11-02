@@ -3,8 +3,10 @@
 
 const NEW_STYLE = /^(\d{4})\.(\d{4,5})(?:v\d+)?$/
 const OLD_STYLE = /^([a-z][a-z-]*(?:\.[A-Za-z]{2})?)\/(\d{7})(?:v\d+)?$/
-// 10.1101/2024.06.28.601293, optionally with a version or .full/.pdf/.source suffix.
-const DOI = /^(10\.1101\/[\d.]+)(?:v\d+)?(?:\.(?:full|pdf|source))?$/
+// A DOI: 10.<registrant>/<suffix>, optionally with a version or .full/.pdf/.source
+// suffix. bioRxiv/medRxiv DOIs (10.1101/…, and newer prefixes like 10.64898/…)
+// have numeric-dot suffixes; the registrant may itself contain dots.
+const DOI = /^(10\.\d{4,}(?:\.\d+)*\/[\d.]+)(?:v\d+)?(?:\.(?:full|pdf|source))?$/
 
 export function parseId(input: string): string | null {
   let s = input.trim().replace(/^https?:\/\//i, '')

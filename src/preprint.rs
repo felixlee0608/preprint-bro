@@ -91,7 +91,11 @@ pub struct PaperRef {
     pub version: Option<u32>,
 }
 
-static DOI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"10\.1101/[A-Za-z0-9][A-Za-z0-9._-]*").unwrap());
+// A DOI: 10.<registrant>/<suffix>. bioRxiv and medRxiv historically mint
+// 10.1101/… DOIs but other registrants (e.g. 10.64898) appear too, so the
+// prefix is any 4+ digit DOI registrant. A DOI is tried on bioRxiv and then
+// medRxiv at fetch time regardless of its prefix.
+static DOI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"10\.\d{4,}(\.\d+)*/[A-Za-z0-9][A-Za-z0-9._-]*").unwrap());
 
 /// The known suffixes a biorxiv.org/medrxiv.org content URL can end in.
 const CONTENT_SUFFIXES: &[&str] = &[".full", ".pdf", ".source"];
@@ -218,6 +222,27 @@ mod tests {
             Some((Source::Medrxiv, "10.1101/2024.06.28.601293".into(), Some(1)))
         );
         // A bare DOI defaults to bioRxiv; medRxiv is probed at fetch time.
+        assert_eq!(r("10.1101/2024.06.28.601293").map(|x| x.0), Some(Source::Biorxiv));
+    }
+
+    #[test]
+    fn any_doi_registrant_resolves_on_biorxiv() {
+        // A DOI need not start with 10.1101: bioRxiv now also mints other
+        // prefixes (e.g. 10.64898). The fetch still tries bioRxiv then medRxiv.
+        for s in [
+            "10.64898/2026.10.26.762046",
+            "https://doi.org/10.64898/2026.10.26.762046",
+        ] {
+            assert_eq!(r(s), Some((Source::Biorxiv, "10.64898/2026.10.26.762046".into(), None)), "{s}");
+        }
+        for s in [
+            "10.64898/2026.10.26.762046v1",
+            "https://doi.org/10.64898/2026.10.26.762046v1",
+            "https://www.biorxiv.org/content/10.64898/2026.10.26.762046v1",
+            "https://www.biorxiv.org/content/10.64898/2026.10.26.762046v1.full",
+        ] {
+            assert_eq!(r(s), Some((Source::Biorxiv, "10.64898/2026.10.26.762046".into(), Some(1))), "{s}");
+        }
         assert_eq!(r("10.1101/2024.06.28.601293").map(|x| x.0), Some(Source::Biorxiv));
     }
 

@@ -23,7 +23,7 @@ export function Home() {
     e.preventDefault()
     const id = parseId(input)
     if (!id) {
-      setError("That doesn't look like a preprint. Paste an arXiv id or link, a bioRxiv/medRxiv link, or a 10.1101/… DOI.")
+      setError("That doesn't look like a preprint. Paste an arXiv id or link, a bioRxiv/medRxiv link, or a DOI.")
       return
     }
     navigate(`/abs/${id}`)
@@ -52,7 +52,7 @@ export function Home() {
               setInput(e.target.value)
               setError('')
             }}
-            placeholder="arxiv.org/abs/1706.03762, a bioRxiv link, or a 10.1101/… DOI"
+            placeholder="arxiv.org/abs/1706.03762, a bioRxiv link, or a DOI like 10.1101/…"
             aria-label="arXiv, bioRxiv or medRxiv link or id"
             className="h-12 w-full rounded-xl sm:flex-1 border border-line bg-white px-4 text-[15px] outline-none transition focus:border-action focus:shadow-[0_0_0_3px_rgba(216,90,48,.18)]"
           />
@@ -60,7 +60,7 @@ export function Home() {
         </form>
         {error && <p className="mt-2.5 text-[13.5px] text-danger-strong">{error}</p>}
         <p className="mt-4 text-[13px] text-fg-3">
-          A bare <span className="font-mono text-fg-2">10.1101/…</span> DOI is looked up on bioRxiv first, then medRxiv.
+          A bare DOI is looked up on bioRxiv first, then medRxiv.
         </p>
         <div className="mt-5 flex flex-wrap gap-2">
           {EXAMPLES.map((x) => (

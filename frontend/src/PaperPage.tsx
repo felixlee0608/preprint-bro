@@ -37,7 +37,7 @@ export function PaperPage() {
 
   useEffect(load, [load])
 
-  if (!id) return <Notice title="That isn't a preprint id or link." body={`“${raw}” doesn't look like one. Try an arXiv id (1706.03762), an arxiv.org link, a bioRxiv/medRxiv link, or a 10.1101/… DOI.`} />
+  if (!id) return <Notice title="That isn't a preprint id or link." body={`“${raw}” doesn't look like one. Try an arXiv id (1706.03762), an arxiv.org link, a bioRxiv/medRxiv link, or a DOI.`} />
   if (error) return <Notice title="Something's not right." body={error} />
   if (!paper) return <p className="pt-16 text-[14px] text-fg-3">Looking up {id}…</p>
 
