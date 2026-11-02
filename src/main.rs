@@ -1,0 +1,393 @@
+//! preprint-bro: paste an arXiv, bioRxiv or medRxiv paper, get an interactive
+//! course. See README.md for what runs where.
+
+mod aero;
+mod app;
+mod arxiv;
+mod bio;
+mod config;
+mod course;
+mod db;
+mod ingest;
+mod llm;
+mod pipeline;
+mod preprint;
+mod qa;
+mod sample;
+mod web;
+
+use anyhow::{Context, Result, bail};
+use std::future::IntoFuture;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use crate::preprint::{PaperRef, Source};
+
+const USAGE: &str = "usage: preprint-bro <command>
+
+  serve            run the site, the admin listener and the build workers
+  build ID         build one paper's course in the foreground (resumes from checkpoints)
+  republish ID     rebuild a finished course's page from its stored lessons with the
+                   current shell, check it in the browser, and update it (no model calls)
+  ingest ID        fetch a paper and write the text the model reads to tmp/
+  qa-sample [nohang]  run browser QA on a hand-written course with broken labs
+  migrate          apply database migrations
+
+  ID is an arXiv id or link, a bioRxiv/medRxiv link, or a 10.1101/… DOI.";
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,chromiumoxide=off")).init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("serve") => serve().await,
+        Some("build") => {
+            let id = args.get(1).and_then(|s| preprint::parse_ref(s)).context("usage: build <paper id or link>")?;
+            build(&id).await
+        }
+        Some("republish") => {
+            let id = args.get(1).and_then(|s| preprint::parse_ref(s)).context("usage: republish <paper id or link>")?;
+            republish(&id.id).await
+        }
+        Some("ingest") => {
+            let id = args.get(1).and_then(|s| preprint::parse_ref(s)).context("usage: ingest <paper id or link>")?;
+            ingest_one(&id).await
+        }
+        Some("qa-sample") => qa_sample(args.get(1).map(String::as_str) == Some("nohang")).await,
+        Some("migrate") => {
+            let url = std::env::var("NEON_DB").context("NEON_DB is not set")?;
+            db::connect(&url).await?;
+            println!("migrations applied");
+            Ok(())
+        }
+        _ => bail!("{USAGE}"),
+    }
+}
+
+async fn serve() -> Result<()> {
+    let cfg = config::Config::from_env()?;
+    let (listen, admin_listen, publish) = (cfg.listen, cfg.admin_listen, cfg.publish);
+    // A dry run builds nothing unless asked to: its workers would otherwise
+    // take real visitors' requests off a shared queue and finish them as
+    // local previews.
+    let workers = if !publish && std::env::var("WORKERS").is_err() { 0 } else { cfg.workers };
+    if !admin_listen.ip().is_loopback() {
+        bail!("ADMIN_LISTEN must be a loopback address; the admin routes have no auth");
+    }
+    // Bind before touching the queue: if another copy already holds the
+    // ports, this one exits without claiming anything.
+    let public = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
+    let admin = tokio::net::TcpListener::bind(admin_listen).await.with_context(|| format!("binding {admin_listen}"))?;
+    log::info!(
+        "preprint-bro starting: listen={listen} admin={admin_listen} workers={workers} publish={publish} endpoint={} model={}",
+        cfg.endpoint.name, cfg.endpoint.model
+    );
+    let app = Arc::new(app::App::new(cfg).await?);
+    let stale = qa::remove_stale_profiles();
+    if stale > 0 {
+        log::info!("removed {stale} browser profile(s) a previous run left behind");
+    }
+    if publish {
+        let n = db::requeue_previews(&app.pool).await?;
+        if n > 0 {
+            log::info!("queued {n} dry-run course(s) to be published");
+            for c in db::all_courses(&app.pool).await? {
+                app.courses.write().unwrap().insert(c.arxiv_id.clone(), c);
+            }
+        }
+    }
+    for n in 0..workers {
+        tokio::spawn(pipeline::worker(app.clone(), n));
+    }
+    // Queued work waits for an enqueue to wake a worker; look now instead.
+    // A job a previous process left running is picked up once its lease
+    // (two minutes) runs out.
+    for _ in 0..workers {
+        app.wake.notify_one();
+    }
+    let admin_app = web::admin(app.clone());
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(admin, admin_app).await {
+            log::error!("admin listener stopped: {e}");
+        }
+    });
+    // Graceful shutdown waits for open connections, and a live progress feed
+    // stays open until its build ends. Give them a few seconds, then exit:
+    // the new process needs the port, and leaving drops (and kills) any QA
+    // browser along with the half-done job, which resumes from its checkpoint.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown().await;
+        let _ = stop_tx.send(true);
+    });
+    let mut graceful = stop_rx.clone();
+    let server = axum::serve(public, web::public(app).into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async move {
+            let _ = graceful.wait_for(|stop| *stop).await;
+        });
+    let mut deadline = stop_rx;
+    tokio::select! {
+        r = server.into_future() => r?,
+        _ = async move {
+            let _ = deadline.wait_for(|stop| *stop).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        } => log::info!("connections still open after 5 s; exiting anyway"),
+    }
+    Ok(())
+}
+
+async fn shutdown() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term.recv() => {},
+    }
+    log::info!("shutting down");
+}
+
+/// Build one course in the foreground. Reruns resume from checkpoints.
+async fn build(r: &PaperRef) -> Result<()> {
+    let cfg = config::Config::from_env()?;
+    let app = Arc::new(app::App::new(cfg).await?);
+    let meta = fetch_meta(&app, r).await?.context("no such paper on arXiv, bioRxiv or medRxiv")?;
+    db::upsert_paper(&app.pool, &meta).await?;
+    if !db::enqueue(&app.pool, &meta.id, None).await? {
+        db::requeue(&app.pool, &meta.id, true).await?;
+    }
+    let started = std::time::Instant::now();
+    if !db::claim_id(&app.pool, &meta.id, pipeline::LEASE).await? {
+        bail!("{} isn't queued any more: a running server's worker took it", meta.id);
+    }
+    pipeline::process(&app, &meta.id).await;
+    let c = db::course(&app.pool, &meta.id).await?.context("course row vanished")?;
+    println!(
+        "{} after {:.0}s: status={} url={} error={}",
+        meta.id,
+        started.elapsed().as_secs_f64(),
+        c.status,
+        c.aero_url.unwrap_or_default(),
+        c.error.unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// Metadata for any preprint, resolved the way the web app resolves it.
+async fn fetch_meta(app: &app::App, r: &PaperRef) -> Result<Option<arxiv::Meta>> {
+    match r.source {
+        Source::Arxiv => app.arxiv.meta(&r.id).await,
+        _ => Ok(app.bio.meta(&r.servers(), &r.id).await?.map(|(m, _)| m)),
+    }
+}
+
+/// Re-assemble a finished course from its stored outline and lessons with
+/// the current shell (labkit, runtime, styles), run browser QA on it, and
+/// publish it in place. The lessons are the ones that were reviewed; nothing
+/// is regenerated, so this costs nothing and changes only the shell.
+async fn republish(id: &str) -> Result<()> {
+    // It makes no model calls, so it does not ask for model settings.
+    let cfg = config::Config::from_env_for(false)?;
+    let app = app::App::new(cfg).await?;
+    let pool = &app.pool;
+    let meta = db::get_paper(pool, id).await?.context("no such paper in the database")?;
+    let row = db::course(pool, id).await?.context("no course for that paper")?;
+    if row.status != "ready" {
+        bail!("{id} is {}, not ready", row.status);
+    }
+    let outline: course::Outline =
+        serde_json::from_str(&db::artifact(pool, id, "outline").await?.context("the outline wasn't kept")?)?;
+    let mut lessons = Vec::new();
+    for i in 1..=outline.lessons.len() {
+        let body = db::artifact(pool, id, &format!("lesson:{i:02}")).await?.with_context(|| format!("lesson {i} wasn't kept"))?;
+        lessons.push(serde_json::from_str::<course::Lesson>(&body)?);
+    }
+    // Figures come from the paper's own server: arXiv's HTML rendering, or
+    // the preprint server's JATS XML.
+    let figures = match meta.source {
+        Source::Arxiv => match app.arxiv.html(id, meta.version).await? {
+            Some((url, html)) => ingest::from_latexml(&url, &html)?.figures,
+            None => Vec::new(),
+        },
+        source @ (Source::Biorxiv | Source::Medrxiv) => {
+            match app.bio.meta(&vec![source], id).await? {
+                Some((_, jatsxml)) => match app.bio.full_xml(&jatsxml).await? {
+                    Some(xml) => ingest::from_jats(source, id, meta.version, &xml)?.figures,
+                    None => Vec::new(),
+                },
+                None => Vec::new(),
+            }
+        }
+    };
+    // A lesson finds its figure by key. If the paper's rendering has changed or
+    // gone, stop rather than publish the course without those figures.
+    let missing = course::missing_figures(&lessons, &figures);
+    if !missing.is_empty() {
+        bail!("the paper no longer serves figures the lessons use ({}); nothing was published", missing.join(", "));
+    }
+    let (model, finished): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT model, finished_at FROM courses WHERE arxiv_id = $1").bind(id).fetch_one(pool).await?;
+    let model = model.unwrap_or_default();
+    let built = finished.unwrap_or_else(chrono::Utc::now).format("%-d %B %Y").to_string();
+    let c = course::Course { meta: &meta, outline: &outline, lessons: &lessons, figures: &figures, model: &model, built: &built };
+
+    // A page AERO would reject is refused before a browser is spent on it.
+    let origin = if app.cfg.publish { app.cfg.public_origin.clone() } else { format!("http://{}", app.cfg.listen) };
+    let html = course::assemble(&c, &origin);
+    course::check_size(&html)?;
+    // The page published last time records which image each lesson showed; if
+    // arXiv's rendering has changed since, a figure key may now mean another one.
+    let qa_html = course::assemble(&c, qa::ORIGIN);
+    match db::artifact(pool, id, "html").await? {
+        Some(published) => {
+            if let Some(why) = course::figures_changed(&course::figure_urls(&published), &course::figure_urls(&qa_html)) {
+                bail!("{why}: the figures no longer match the published course; nothing was published");
+            }
+        }
+        None => println!("note: there is no stored copy of the published page, so its figures were not compared"),
+    }
+    let labs: Vec<usize> = (0..lessons.len()).filter(|&i| !lessons[i].lab_dropped).collect();
+    let report = qa::run(qa::Input {
+        course_html: qa_html,
+        lab_pages: labs.iter().map(|&i| (i + 1, course::lab_page(&c, qa::ORIGIN, i))).collect(),
+        figure_prefix: Some(match meta.source {
+            Source::Arxiv => format!("https://arxiv.org/html/{id}"),
+            s => format!("https://{}/content/{}v{}/", s.host(), id, meta.version),
+        }),
+        chrome: &app.cfg.chrome,
+        screenshots: false,
+    })
+    .await?;
+    let failing: Vec<_> = report.labs.iter().filter(|l| !l.ok).collect();
+    for l in &failing {
+        println!("lab {}: {}", l.lesson, l.problems.join("; "));
+    }
+    for p in &report.page_problems {
+        println!("page: {p}");
+    }
+    if !failing.is_empty() || !report.page_problems.is_empty() {
+        bail!("browser QA found problems; nothing was published");
+    }
+    if app.cfg.publish {
+        let page = row.aero_page_id.filter(|p| p != "preview").context("the course has no AERO page to update")?;
+        app.aero.update_page(&page, &html).await?;
+        db::put_artifact(pool, id, "html", &html).await?;
+        println!("republished {id}: {} ({} KB), QA clean on {} labs", row.aero_url.as_deref().unwrap_or(&page), html.len() / 1024, labs.len());
+    } else {
+        std::fs::create_dir_all("tmp")?;
+        let out = format!("tmp/{}.html", meta.source.alias(id));
+        std::fs::write(&out, &html)?;
+        println!("dry run: wrote {out} ({} KB), QA clean on {} labs; PUBLISH=1 updates the page", html.len() / 1024, labs.len());
+    }
+    Ok(())
+}
+
+async fn ingest_one(r: &PaperRef) -> Result<()> {
+    let meta = match r.source {
+        Source::Arxiv => arxiv::Client::new()?.meta(&r.id).await?.context("no such paper")?,
+        _ => {
+            let bio = bio::Client::new()?;
+            let (m, jatsxml) = bio.meta(&r.servers(), &r.id).await?.context("no such paper")?;
+            println!("{} v{} — {}\nlicense: {:?}\ncategories: {:?}", m.id, m.version, m.title, m.license, m.categories);
+            let paper = match bio.full_xml(&jatsxml).await? {
+                Some(xml) => ingest::from_jats(m.source, &m.id, m.version, &xml)?,
+                None => bail!("{} has no full text for this paper", m.source.label()),
+            };
+            println!(
+                "source: {} | {} chars | ~{}K tokens | {} figures",
+                paper.kind,
+                paper.text.len(),
+                paper.text.len() / 3500,
+                paper.figures.len()
+            );
+            std::fs::create_dir_all("tmp")?;
+            let out = format!("tmp/{}.md", m.source.alias(&m.id));
+            std::fs::write(&out, &paper.text)?;
+            println!("wrote {out}");
+            return Ok(());
+        }
+    };
+    println!("{} v{} — {}\nlicense: {:?}\ncategories: {:?}", meta.id, meta.version, meta.title, meta.license, meta.categories);
+    let client = arxiv::Client::new()?;
+    let paper = match client.html(&meta.id, meta.version).await? {
+        Some((url, html)) => ingest::from_latexml(&url, &html)?,
+        None => match client.eprint(&meta.id, meta.version).await? {
+            Some(bytes) => ingest::from_eprint(&bytes)?,
+            None => bail!("no source"),
+        },
+    };
+    println!(
+        "source: {} | {} chars | ~{}K tokens | {} figures",
+        paper.kind,
+        paper.text.len(),
+        paper.text.len() / 3500,
+        paper.figures.len()
+    );
+    std::fs::create_dir_all("tmp")?;
+    let out = format!("tmp/{}.md", meta.source.alias(&meta.id));
+    std::fs::write(&out, &paper.text)?;
+    println!("wrote {out}");
+    Ok(())
+}
+
+async fn qa_sample(skip_hang: bool) -> Result<()> {
+    let chrome = std::path::PathBuf::from(
+        std::env::var("CHROME_PATH").unwrap_or_else(|_| ".chrome/chrome-headless-shell-mac-arm64/chrome-headless-shell".into()),
+    );
+    let (meta, mut outline, mut lessons) = sample::course();
+    if skip_hang {
+        outline.lessons.pop();
+        lessons.pop();
+    }
+    // A figure whose image cannot load, so the page check has one to find.
+    let figures = vec![ingest::Figure {
+        key: "F1".into(),
+        url: "https://figures.invalid/missing.png".into(),
+        caption: "A figure that does not load.".into(),
+    }];
+    lessons[0].figure = "F1".into();
+    let c = course::Course {
+        meta: &meta,
+        outline: &outline,
+        lessons: &lessons,
+        figures: &figures,
+        model: "none",
+        built: "today",
+    };
+    std::fs::create_dir_all("tmp")?;
+    std::fs::write("tmp/sample-course.html", course::assemble(&c, "http://localhost"))?;
+    let lab_pages = (0..lessons.len()).map(|i| (i + 1, course::lab_page(&c, qa::ORIGIN, i))).collect();
+    let started = std::time::Instant::now();
+    let report = qa::run(qa::Input {
+        course_html: course::assemble(&c, qa::ORIGIN),
+        lab_pages,
+        figure_prefix: None,
+        chrome: &chrome,
+        screenshots: true,
+    })
+    .await?;
+    println!("QA took {:.1}s", started.elapsed().as_secs_f64());
+    println!("page: {:?}", report.page_problems);
+    for l in &report.labs {
+        println!("lab {} ok={} problems={:?}", l.lesson, l.ok, l.problems);
+    }
+    // The sample is only worth running if QA gives each lab the right verdict.
+    let mut wrong: Vec<String> = report
+        .labs
+        .iter()
+        .filter_map(|l| {
+            let name = &outline.lessons[l.lesson - 1].nav_title;
+            let should_pass = sample::GOOD.contains(&name.as_str());
+            (l.ok != should_pass).then(|| format!("lab {} ({name}) should {} but {}", l.lesson, if should_pass { "pass" } else { "fail" }, if l.ok { "passed" } else { "failed" }))
+        })
+        .collect();
+    let (what, expected) = if skip_hang { ("the broken figure", "figure image didn't load") } else { ("the skipped page check", "skipped because a lab hangs") };
+    if !report.page_problems.iter().any(|p| p.contains(expected)) {
+        wrong.push(format!("{what} was not reported"));
+    }
+    if !wrong.is_empty() {
+        bail!("browser QA gave the wrong verdict:\n  {}", wrong.join("\n  "));
+    }
+    println!("every sample lab got the right verdict");
+    Ok(())
+}
